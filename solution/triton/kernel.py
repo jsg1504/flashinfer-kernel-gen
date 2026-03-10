@@ -29,6 +29,8 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
+        triton.Config({"BV": 2}, num_warps=1, num_stages=1),
+        triton.Config({"BV": 2}, num_warps=2, num_stages=1),
         triton.Config({"BV": 4}, num_warps=1, num_stages=1),
         triton.Config({"BV": 4}, num_warps=2, num_stages=1),
         triton.Config({"BV": 8}, num_warps=1, num_stages=1),

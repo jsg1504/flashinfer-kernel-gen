@@ -29,6 +29,7 @@
 | O19 | BV=4 autotune config | Tiling | BV=4 config 추가로 더 많은 block 생성 → SM 활용도 및 occupancy 개선. |
 | O20 | `.contiguous()` 제거 | Python | `.contiguous()` 호출 제거. Benchmark가 contiguous tensor를 보장하므로 불필요한 Python 오버헤드 제거. |
 | O21 | q/k block pointer (TMA) | Memory | q, k 로드를 `tl.make_block_ptr`로 변환. `o_k = tl.arange(0, K)` 변수 제거. 모든 메모리 접근이 TMA 경로 사용. |
+| O22 | BV=2 autotune config | Tiling | BV=2 config 추가. 512 blocks 생성으로 SM 활용도 극대화. B200(192 SM)에서 2.67 waves → BV=4(1.33 waves) 대비 2배 SM saturation. |
 
 ---
 
@@ -189,6 +190,36 @@
 - 이 변경으로 모든 메모리 접근이 `tl.make_block_ptr` 통일 — TMA 최적화 기반 완료
 - **B200에서 벤치마크 필요** — TMA 효과 측정 가능
 ---
+### Attempt 7 — O22: BV=2 Autotune Config (SM Saturation)
+
+**적용 최적화:** O1–O14, O16–O22 (O22 신규)
+
+**변경 사항:**
+- Autotune에 `BV=2` configs 2개 추가 (num_warps=1, 2)
+- 총 autotune config: 12 → 14개
+- BV=2 시 grid = (64, 8) → 512 blocks. RTX 2070 SUPER의 40 SM에 대해 12.8 waves
+- B200 (192 SM)에서 512/192 = 2.67 waves → BV=4(1.33 waves) 대비 2배 SM saturation
+
+**결과 (RTX 2070 SUPER):**
+- 정확성: 20/20 PASSED
+- Latency: 0.035 ~ 0.055 ms (avg ~0.052 ms)
+- Speedup: 34.72x ~ 54.44x vs reference
+- Max abs_err: 1.56e-02
+
+**이전 대비:**
+- Avg Latency: 0.0529 → 0.0515 ms (**−2.6%** — noise 범위, 실질적 변화 미미)
+- Min Latency: 0.043 → 0.035 ms (−18.6% — 일부 workload에서 autotune이 BV=2 선택 시 개선)
+- Max Latency: 0.056 → 0.055 ms (동일)
+- 정확성: 유지 (20/20 PASS, abs_err 동일)
+
+**비고:**
+- RTX 2070 SUPER에서는 avg 개선이 noise 수준 (−2.6%)
+- BV=2 시 state tile [2,128] = 256 f32 → thread당 ~8 레지스터로 최대 occupancy
+- B200 (192 SM)에서 autotune이 BV=2를 선택하면 SM saturation 2배 개선 기대
+- O19 (BV=4)에서 −5.7% 개선을 보였으므로, BV=2는 B200에서 추가 이점 예상
+- Zero-risk 변경: autotune이 더 느리면 BV=2를 선택하지 않음
+- **B200에서 벤치마크 필요** — autotune이 BV=2를 선택하는지 확인
+---
 
 ## 미적용 최적화 후보
 
@@ -203,5 +234,6 @@
 | ~~C7~~ | ~~1D grid flattening~~ | ~~Scheduling~~ | ~~2D grid scheduling overhead 제거~~ | **적용됨 → O18** |
 | ~~C8~~ | ~~BV=4 autotune config~~ | ~~Tiling~~ | ~~더 많은 block으로 SM 활용도 증가~~ | **적용됨 → O19** |
 | ~~C9~~ | ~~`.contiguous()` 제거~~ | ~~Python~~ | ~~wrapper의 CPU overhead ~3-6µs 감소~~ | **적용됨 → O20 (성능 변화 없음)** |
+| ~~C12~~ | ~~BV=2 autotune config~~ | ~~Tiling~~ | ~~512 blocks로 SM saturation 극대화~~ | **적용됨 → O22 (RTX 2070에서 −2.6%, B200 확인 필요)** |
 | C10 | `do_not_specialize` | Compile | 고정 값 인자의 specialization cache 감소 | fla-org 패턴. 전체 성능 영향 미미. |
 | C11 | CUDA Graphs wrapping | Launch | kernel launch overhead 10-25µs 제거 | Framework-level 최적화. 커널 코드 변경 아님. |
