@@ -153,11 +153,14 @@ def gdn_decode_fused_kernel(
     # 3. Apply beta gate
     b_v *= b_beta
 
-    # 4. Rank-1 state update: state += delta_v ⊗ k
-    b_h += b_v[:, None] * b_k[None, :]
+    # 4. Compute output via algebraic identity (O17: critical path shortening)
+    #    output = q @ (state + outer(delta, k))
+    #           = q @ state + delta * dot(k, q)     ← no dependency on state update
+    b_kq = tl.sum(b_k * b_q)  # scalar: dot(k, q_scaled)
+    b_o = tl.sum(b_h * b_q[None, :], 1) + b_v * b_kq
 
-    # 5. Compute output: o = scale * q @ state (q already pre-scaled)
-    b_o = tl.sum(b_h * b_q[None, :], 1)
+    # 5. Rank-1 state update (now independent of output — can overlap with output store)
+    b_h += b_v[:, None] * b_k[None, :]
 
     # ── Store output [B, 1, HV, V] via block pointer ─────────────────
     p_output = tl.make_block_ptr(

@@ -44,14 +44,15 @@ h_state = old_state + outer(k, new_v - old_v)
         = old_state + outer(k, β*(v - old_v))
 ```
 
-**최적화된 5단계 (실제 커널에 적용):**
+**최적화된 6단계 (O17 적용 후 실제 커널):**
 
 ```python
 b_h *= tl.exp(b_log_g)                    # ① decay (in-place)
 b_v -= tl.sum(b_h * b_k[None, :], 1)     # ② delta: v -= k@state
 b_v *= b_beta                             # ③ beta gate (in-place)
-b_h += b_v[:, None] * b_k[None, :]       # ④ rank-1 update (outer 1회)
-b_o = tl.sum(b_h * b_q[None, :], 1)      # ⑤ output
+b_kq = tl.sum(b_k * b_q)                 # ④ scalar: dot(k, q_scaled)
+b_o = tl.sum(b_h * b_q[None, :], 1) + b_v * b_kq  # ⑤ output (algebraic identity)
+b_h += b_v[:, None] * b_k[None, :]       # ⑥ rank-1 update (now independent of output)
 ```
 
 **효과:**
@@ -101,6 +102,33 @@ b_beta = tl.sigmoid(b_b_val)
 - 추가 global memory read/write 제거
 - Gate 계산은 scalar 연산 4~5개뿐이라 커널 launch overhead 대비 이득이 큼
 
+### 1.4 Algebraic Output Reformulation (O17)
+
+Output 계산을 updated state가 아닌 decayed state에서 수행하여 critical path를 단축:
+
+```python
+# Before (output depends on state update):
+b_h += b_v[:, None] * b_k[None, :]       # state update ← output이 이것에 의존
+b_o = tl.sum(b_h * b_q[None, :], 1)      # output from UPDATED state
+
+# After (output independent of state update):
+b_kq = tl.sum(b_k * b_q)                 # scalar: dot(k, q)
+b_o = tl.sum(b_h * b_q[None, :], 1) + b_v * b_kq  # output from DECAYED state + correction
+b_h += b_v[:, None] * b_k[None, :]       # state update (now independent)
+```
+
+**수학적 증명:**
+```
+output = q @ (state + outer(delta, k))      # 원래 공식
+       = q @ state + q @ outer(delta, k)    # 분배법칙
+       = q @ state + delta * (k · q)        # outer product의 contraction
+```
+
+**효과:**
+- State update와 output 계산 사이의 RAW register dependency 제거
+- 컴파일러가 output store와 state update/store를 병렬 스케줄링 가능
+- 추가 비용: scalar dot product (K muls + K adds) + BV muls + BV adds — 무시 가능
+- Memory-bound 커널에서는 효과 미미하지만, HBM이 빠른 GPU(B200)에서 compute overlap 이점 기대
 ---
 
 ## 2. Triton 커널 설계 노하우

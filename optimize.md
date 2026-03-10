@@ -24,6 +24,7 @@
 | O14 | num_stages=1 | Compile | T=1 decode에서 loop 없으므로 software pipelining 비활성화. 불필요한 prefetch 코드 제거. |
 | O15 | Contiguous 보장 | Memory | Python wrapper에서 `.contiguous()` 호출. Non-contiguous tensor의 잘못된 pointer arithmetic 방지. |
 | O16 | `tl.make_block_ptr` (TMA) | Memory | 모든 2D/1D masked load/store를 block pointer로 교체. HW 주소 계산 + boundary check. Hopper+에서 TMA 엔진 활용. |
+| O17 | Algebraic output reformulation | Algorithm | Output을 updated state 대신 decayed state + scalar correction으로 계산. State update와 output 사이의 데이터 의존성 제거 → critical path 단축. |
 
 ---
 
@@ -70,6 +71,34 @@
 - RTX 2070 SUPER (Turing, SM75)에서는 `tl.make_block_ptr`이 일반 load로 fallback하여 성능 차이 없음
 - B200 (Blackwell)에서는 TMA 엔진이 주소 계산을 HW에서 처리하여 SM ALU 절감 기대
 - 코드가 더 깔끔해짐 (pointer arithmetic + mask 패턴 → block pointer + boundary_check 패턴)
+- B200에서 벤치마크 필요
+---
+### Attempt 3 — O17: Algebraic Output Reformulation (Critical Path Shortening)
+
+**적용 최적화:** O1–O17 (O17 신규)
+
+**변경 사항:**
+- Output 계산을 `q @ updated_state`에서 `q @ decayed_state + delta * dot(k, q)`로 변경
+- 수학적 동치: `q @ (S + outer(d,k)) = q @ S + d * dot(k,q)` (분배법칙)
+- State rank-1 update와 output 계산 사이의 RAW register dependency 제거
+- 컴파일러가 output store와 state update를 병렬 스케줄링 가능
+
+**결과 (RTX 2070 SUPER):**
+- 정확성: 20/20 PASSED
+- Latency: 0.048 ~ 0.059 ms (avg ~0.056 ms)
+- Speedup: 32.69x ~ 39.68x vs reference
+- Max abs_err: 3.12e-02
+
+**이전 대비:**
+- Latency: 동일 (~0.056 ms, RTX 2070에서는 memory/launch overhead 지배적이라 compute overlap 효과 미미)
+- 정확성: 유지 (20/20 PASS, abs_err 동일)
+- Min latency: 0.054 → 0.048 ms (11% 감소 — 일부 workload에서 스케줄링 이점 확인)
+
+**비고:**
+- RTX 2070 SUPER에서는 avg latency 동일 (memory-bound에서 compute overlap 효과가 noise에 묻힘)
+- B200 (HBM 8 TB/s)에서는 memory가 빨라 compute가 상대적으로 더 중요 → overlap 이점 기대
+- 추가 연산: K muls + K adds (scalar dot product) + BV muls + BV adds — 전체 대비 무시 가능
+- fla-org upstream에서도 `tl.dot` 미사용 확인 — element-wise + reduce 패턴이 recurrent kernel의 표준
 - B200에서 벤치마크 필요
 ---
 
