@@ -29,20 +29,30 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
-        triton.Config({"BV": 2}, num_warps=1, num_stages=1),
-        triton.Config({"BV": 2}, num_warps=2, num_stages=1),
-        triton.Config({"BV": 4}, num_warps=1, num_stages=1),
-        triton.Config({"BV": 4}, num_warps=2, num_stages=1),
-        triton.Config({"BV": 8}, num_warps=1, num_stages=1),
-        triton.Config({"BV": 8}, num_warps=2, num_stages=1),
-        triton.Config({"BV": 16}, num_warps=1, num_stages=1),
-        triton.Config({"BV": 16}, num_warps=2, num_stages=1),
-        triton.Config({"BV": 32}, num_warps=2, num_stages=1),
-        triton.Config({"BV": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BV": 64}, num_warps=4, num_stages=1),
-        triton.Config({"BV": 64}, num_warps=8, num_stages=1),
-        triton.Config({"BV": 128}, num_warps=4, num_stages=1),
-        triton.Config({"BV": 128}, num_warps=8, num_stages=1),
+        # ── BK=128 configs (single-pass, no K-split) ── identical to pre-C5 ──
+        triton.Config({"BV": 2, "BK": 128}, num_warps=1, num_stages=1),
+        triton.Config({"BV": 2, "BK": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BV": 4, "BK": 128}, num_warps=1, num_stages=1),
+        triton.Config({"BV": 4, "BK": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BV": 8, "BK": 128}, num_warps=1, num_stages=1),
+        triton.Config({"BV": 8, "BK": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BV": 16, "BK": 128}, num_warps=1, num_stages=1),
+        triton.Config({"BV": 16, "BK": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BV": 32, "BK": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BV": 32, "BK": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 64, "BK": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 64, "BK": 128}, num_warps=8, num_stages=1),
+        triton.Config({"BV": 128, "BK": 128}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 128, "BK": 128}, num_warps=8, num_stages=1),
+        # ── BK=64 configs (K-split 64+64, register pressure relief for BV≥16) ──
+        triton.Config({"BV": 16, "BK": 64}, num_warps=1, num_stages=1),
+        triton.Config({"BV": 16, "BK": 64}, num_warps=2, num_stages=1),
+        triton.Config({"BV": 32, "BK": 64}, num_warps=2, num_stages=1),
+        triton.Config({"BV": 32, "BK": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 64, "BK": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 64, "BK": 64}, num_warps=8, num_stages=1),
+        triton.Config({"BV": 128, "BK": 64}, num_warps=4, num_stages=1),
+        triton.Config({"BV": 128, "BK": 64}, num_warps=8, num_stages=1),
     ],
     key=["K", "V"],
 )
@@ -67,6 +77,7 @@ def gdn_decode_fused_kernel(
     K: tl.constexpr,  # head_size = 128
     V: tl.constexpr,  # head_size = 128
     BV: tl.constexpr,  # V block size (autotuned)
+    BK: tl.constexpr,  # K block size (autotuned: 128=single-pass, 64=K-split)
     USE_INITIAL_STATE: tl.constexpr,
 ):
     """
@@ -74,53 +85,22 @@ def gdn_decode_fused_kernel(
 
     Grid: 1D flattened (V // BV * B * HV,) — avoids 2D grid scheduling overhead.
     Each program processes one (batch, v_head, V-tile) combination.
-    State: k-last layout [V, K] loaded as [BV, K] tiles via block pointers (TMA on Hopper+).
+    State: k-last layout [V, K] loaded as [BV, K] or [BV, BK] tiles via block pointers.
+
+    When BK == K (128): single-pass, identical to pre-C5 behavior.
+    When BK < K (64): 2-pass K-split for register pressure relief.
+      Phase 1: accumulate K-reductions (k@state, dot(k,q), q@state)
+      Phase 2: reload state (L2 hit), apply rank-1 update, store
     """
     # ── Program identification (1D grid, manually decomposed) ──────────
     pid = tl.program_id(0)
     NV: tl.constexpr = (V + BV - 1) // BV  # number of V-tiles (compile-time)
+    NK: tl.constexpr = K // BK  # number of K-tiles (1 or 2)
     i_v = pid % NV       # V-tile index
     i_bh = pid // NV     # batch * v_head flattened index
     i_b = i_bh // HV     # batch index
     i_hv = i_bh % HV     # v_head index [0..7]
     i_h = i_hv // (HV // H)  # GVA: map v_head → q/k head [0,0,1,1,2,2,3,3]
-
-    # ── Load state tile [BV, K] via block pointer (TMA on Hopper+) ────
-    # state: [B, HV, V, K] contiguous, k-last layout
-    # tl.make_block_ptr lets HW handle address calc + boundary check
-    p_state = tl.make_block_ptr(
-        state_ptr + (i_b * HV + i_hv) * V * K,
-        shape=(V, K),
-        strides=(K, 1),
-        offsets=(i_v * BV, 0),
-        block_shape=(BV, K),
-        order=(1, 0),  # K is contiguous (col-major in ptr terms)
-    )
-    if USE_INITIAL_STATE:
-        b_h = tl.load(p_state, boundary_check=(0,)).to(tl.float32)
-    else:
-        b_h = tl.zeros([BV, K], dtype=tl.float32)
-
-    # ── Load q[K], k[K] via block pointer (GVA: indexed by q/k head) ─
-    # q, k: [B, 1, H, K] contiguous — K is full block, no boundary check needed
-    p_q = tl.make_block_ptr(
-        q_ptr + (i_b * H + i_h) * K,
-        shape=(K,),
-        strides=(1,),
-        offsets=(0,),
-        block_shape=(K,),
-        order=(0,),
-    )
-    p_k = tl.make_block_ptr(
-        k_ptr + (i_b * H + i_h) * K,
-        shape=(K,),
-        strides=(1,),
-        offsets=(0,),
-        block_shape=(K,),
-        order=(0,),
-    )
-    b_q = tl.load(p_q).to(tl.float32)
-    b_k = tl.load(p_k).to(tl.float32)
 
     # ── Load v[BV] via block pointer ──────────────────────────────────
     # v: [B, 1, HV, V] contiguous
@@ -148,60 +128,157 @@ def gdn_decode_fused_kernel(
     # log(g) = -exp(A_log) * softplus(a + dt_bias)
     # g = exp(log_g) ∈ (0, 1)
     b_log_g = -tl.exp(b_A_log) * b_sp
+    b_g = tl.exp(b_log_g)  # pre-compute decay factor (scalar, used in both paths)
 
     # beta = sigmoid(b) ∈ (0, 1)
     b_beta = tl.sigmoid(b_b_val)
 
-    # Pre-scale q (saves one multiply in the output computation)
-    b_q = b_q * scale
+    # ── Base pointers for state and q/k (shared by both paths) ────────
+    state_base = state_ptr + (i_b * HV + i_hv) * V * K
+    qk_base_q = q_ptr + (i_b * H + i_h) * K
+    qk_base_k = k_ptr + (i_b * H + i_h) * K
 
-    # ── Delta Rule Update (k-last state [BV, K]) ────────────────────────
-    #
-    # In k-last layout, b_h[j, i] represents state^T[v_j, k_i]
-    # All operations use transposed formulas:
-    #   k @ state = sum_k state^T[v, k] * k[k]  →  tl.sum(b_h * b_k, axis=1)
-    #   outer(v, k) in transposed space           →  v[:, None] * k[None, :]
-    #   q @ state = sum_k state^T[v, k] * q[k]  →  tl.sum(b_h * b_q, axis=1)
+    if NK == 1:
+        # ══════════════════════════════════════════════════════════════
+        # Single-pass (BK == K): identical to pre-C5 kernel
+        # ══════════════════════════════════════════════════════════════
+        p_state = tl.make_block_ptr(
+            state_base,
+            shape=(V, K),
+            strides=(K, 1),
+            offsets=(i_v * BV, 0),
+            block_shape=(BV, K),
+            order=(1, 0),
+        )
+        if USE_INITIAL_STATE:
+            b_h = tl.load(p_state, boundary_check=(0,)).to(tl.float32)
+        else:
+            b_h = tl.zeros([BV, K], dtype=tl.float32)
 
-    # 1. Apply decay: state *= exp(log_g) = g
-    b_h *= tl.exp(b_log_g)
+        p_q = tl.make_block_ptr(
+            qk_base_q, shape=(K,), strides=(1,),
+            offsets=(0,), block_shape=(K,), order=(0,),
+        )
+        p_k = tl.make_block_ptr(
+            qk_base_k, shape=(K,), strides=(1,),
+            offsets=(0,), block_shape=(K,), order=(0,),
+        )
+        b_q = tl.load(p_q).to(tl.float32) * scale
+        b_k = tl.load(p_k).to(tl.float32)
 
-    # 2. Compute delta: v -= k @ state  (error signal)
-    b_v -= tl.sum(b_h * b_k[None, :], 1)
+        # Delta Rule Update (same as pre-C5)
+        b_h *= b_g
+        b_v -= tl.sum(b_h * b_k[None, :], 1)
+        b_v *= b_beta
+        b_kq = tl.sum(b_k * b_q)
+        b_o = tl.sum(b_h * b_q[None, :], 1) + b_v * b_kq
+        b_h += b_v[:, None] * b_k[None, :]
 
-    # 3. Apply beta gate
-    b_v *= b_beta
+        # Store output
+        p_output = tl.make_block_ptr(
+            output_ptr + (i_b * HV + i_hv) * V,
+            shape=(V,), strides=(1,),
+            offsets=(i_v * BV,), block_shape=(BV,), order=(0,),
+        )
+        tl.store(p_output, b_o.to(tl.bfloat16), boundary_check=(0,))
 
-    # 4. Compute output via algebraic identity (O17: critical path shortening)
-    #    output = q @ (state + outer(delta, k))
-    #           = q @ state + delta * dot(k, q)     ← no dependency on state update
-    b_kq = tl.sum(b_k * b_q)  # scalar: dot(k, q_scaled)
-    b_o = tl.sum(b_h * b_q[None, :], 1) + b_v * b_kq
+        # Store updated state
+        p_new_state = tl.make_block_ptr(
+            new_state_ptr + (i_b * HV + i_hv) * V * K,
+            shape=(V, K), strides=(K, 1),
+            offsets=(i_v * BV, 0), block_shape=(BV, K), order=(1, 0),
+        )
+        tl.store(p_new_state, b_h.to(tl.float32), boundary_check=(0,))
+    else:
+        # ══════════════════════════════════════════════════════════════
+        # K-split 2-pass (BK < K): reduced register pressure
+        #
+        # Phase 1: Load K-tiles, decay, accumulate K-reductions
+        #          (state tiles NOT kept — registers freed after each tile)
+        # Phase 2: Reload state (L2 cache hit), re-decay, rank-1 update, store
+        # ══════════════════════════════════════════════════════════════
 
-    # 5. Rank-1 state update (now independent of output — can overlap with output store)
-    b_h += b_v[:, None] * b_k[None, :]
+        # ── Phase 1: Accumulate full-K reductions ─────────────────────
+        b_kstate_acc = tl.zeros([BV], dtype=tl.float32)  # k @ state accumulator
+        b_qstate_acc = tl.zeros([BV], dtype=tl.float32)  # q @ state accumulator
+        b_kq_acc = 0.0  # dot(k, q_scaled) accumulator (becomes tl scalar)
 
-    # ── Store output [B, 1, HV, V] via block pointer ─────────────────
-    p_output = tl.make_block_ptr(
-        output_ptr + (i_b * HV + i_hv) * V,
-        shape=(V,),
-        strides=(1,),
-        offsets=(i_v * BV,),
-        block_shape=(BV,),
-        order=(0,),
-    )
-    tl.store(p_output, b_o.to(tl.bfloat16), boundary_check=(0,))
+        for i_k in range(0, K, BK):
+            # Load state tile [BV, BK]
+            p_s = tl.make_block_ptr(
+                state_base, shape=(V, K), strides=(K, 1),
+                offsets=(i_v * BV, i_k), block_shape=(BV, BK), order=(1, 0),
+            )
+            if USE_INITIAL_STATE:
+                b_h_tile = tl.load(p_s, boundary_check=(0,)).to(tl.float32)
+            else:
+                b_h_tile = tl.zeros([BV, BK], dtype=tl.float32)
 
-    # ── Store updated state [B, HV, V, K] via block pointer ──────────
-    p_new_state = tl.make_block_ptr(
-        new_state_ptr + (i_b * HV + i_hv) * V * K,
-        shape=(V, K),
-        strides=(K, 1),
-        offsets=(i_v * BV, 0),
-        block_shape=(BV, K),
-        order=(1, 0),
-    )
-    tl.store(p_new_state, b_h.to(tl.float32), boundary_check=(0,))
+            # Load q, k tiles [BK]
+            p_qt = tl.make_block_ptr(
+                qk_base_q, shape=(K,), strides=(1,),
+                offsets=(i_k,), block_shape=(BK,), order=(0,),
+            )
+            p_kt = tl.make_block_ptr(
+                qk_base_k, shape=(K,), strides=(1,),
+                offsets=(i_k,), block_shape=(BK,), order=(0,),
+            )
+            b_q_tile = tl.load(p_qt).to(tl.float32) * scale  # pre-scaled
+            b_k_tile = tl.load(p_kt).to(tl.float32)
+
+            # Decay state tile
+            b_h_tile *= b_g
+
+            # Accumulate partial K-reductions
+            b_kstate_acc += tl.sum(b_h_tile * b_k_tile[None, :], 1)  # [BV]
+            b_kq_acc = b_kq_acc + tl.sum(b_k_tile * b_q_tile)  # scalar
+            b_qstate_acc += tl.sum(b_h_tile * b_q_tile[None, :], 1)  # [BV]
+            # b_h_tile goes out of scope → registers freed
+
+        # ── Compute delta and output (using accumulated reductions) ───
+        b_v -= b_kstate_acc       # delta: v -= k @ state
+        b_v *= b_beta             # beta gate
+        b_o = b_qstate_acc + b_v * b_kq_acc  # O17: algebraic identity
+
+        # Store output
+        p_output = tl.make_block_ptr(
+            output_ptr + (i_b * HV + i_hv) * V,
+            shape=(V,), strides=(1,),
+            offsets=(i_v * BV,), block_shape=(BV,), order=(0,),
+        )
+        tl.store(p_output, b_o.to(tl.bfloat16), boundary_check=(0,))
+
+        # ── Phase 2: Reload state, re-decay, rank-1 update, store ────
+        new_state_base = new_state_ptr + (i_b * HV + i_hv) * V * K
+
+        for i_k in range(0, K, BK):
+            # Re-load state tile (L2 cache hit from Phase 1 read)
+            p_s = tl.make_block_ptr(
+                state_base, shape=(V, K), strides=(K, 1),
+                offsets=(i_v * BV, i_k), block_shape=(BV, BK), order=(1, 0),
+            )
+            if USE_INITIAL_STATE:
+                b_h_tile = tl.load(p_s, boundary_check=(0,)).to(tl.float32)
+            else:
+                b_h_tile = tl.zeros([BV, BK], dtype=tl.float32)
+
+            # Re-load k tile (L1/L2 cache hit)
+            p_kt = tl.make_block_ptr(
+                qk_base_k, shape=(K,), strides=(1,),
+                offsets=(i_k,), block_shape=(BK,), order=(0,),
+            )
+            b_k_tile = tl.load(p_kt).to(tl.float32)
+
+            # Re-decay + rank-1 update
+            b_h_tile *= b_g
+            b_h_tile += b_v[:, None] * b_k_tile[None, :]
+
+            # Store to new_state
+            p_ns = tl.make_block_ptr(
+                new_state_base, shape=(V, K), strides=(K, 1),
+                offsets=(i_v * BV, i_k), block_shape=(BV, BK), order=(1, 0),
+            )
+            tl.store(p_ns, b_h_tile.to(tl.float32), boundary_check=(0,))
 
 
 def kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):

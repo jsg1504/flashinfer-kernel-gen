@@ -30,6 +30,7 @@
 | O20 | `.contiguous()` 제거 | Python | `.contiguous()` 호출 제거. Benchmark가 contiguous tensor를 보장하므로 불필요한 Python 오버헤드 제거. |
 | O21 | q/k block pointer (TMA) | Memory | q, k 로드를 `tl.make_block_ptr`로 변환. `o_k = tl.arange(0, K)` 변수 제거. 모든 메모리 접근이 TMA 경로 사용. |
 | O22 | BV=2 autotune config | Tiling | BV=2 config 추가. 512 blocks 생성으로 SM 활용도 극대화. B200(192 SM)에서 2.67 waves → BV=4(1.33 waves) 대비 2배 SM saturation. |
+| O23 | K-tile split (BK autotune) | Tiling | BK∈{64,128} autotune 추가. BK=128은 single-pass(기존), BK=64는 2-pass K-split으로 레지스터 압력 감소. BV≥16에서 occupancy 개선. |
 
 ---
 
@@ -220,6 +221,48 @@
 - Zero-risk 변경: autotune이 더 느리면 BV=2를 선택하지 않음
 - **B200에서 벤치마크 필요** — autotune이 BV=2를 선택하는지 확인
 ---
+### Attempt 8 — C6 조사 + C5→O23: K-tile Split (BK=64 Autotune)
+
+**C6 조사 결과: 적용 불가**
+- Triton warp specialization은 `tl.range(warp_specialize=True)` 루프 기반 파이프라인 기법
+- T=1 no-loop 커널에 구조적으로 적용 불가 (루프가 없어 producer/consumer 파이프라인 성립 안함)
+- V-tile을 루프로 변환하면 grid 512→8 blocks로 SM 활용도 파괴
+- `gl.warp_specialize()` (Gluon) 실험적 API도 overhead > benefit
+- optimize.md에 "적용 불가"로 기록
+
+**적용 최적화:** O1–O14, O16–O23 (O23 신규)
+
+**변경 사항:**
+- `BK` constexpr 파라미터 추가 (autotune: 64 또는 128)
+- `NK: tl.constexpr = K // BK`로 K-tile 수 결정
+- `if NK == 1:` → single-pass (BK=128, 기존 코드와 동일 — zero regression risk)
+- `else:` → 2-pass K-split (BK=64, BV≥16에서 레지스터 압력 감소)
+  - Phase 1: K-tile별 state 로드 → decay → K-reduction 누적 (k@state, dot(k,q), q@state)
+  - Compute delta + output (누적된 reduction 사용)
+  - Phase 2: state 재로드 (L2 cache hit) → re-decay → rank-1 update → store
+- BK=64 configs 8개 추가 (BV∈{16,32,64,128} × num_warps∈{1/2,2/4,4/8})
+- 총 autotune config: 14 → 22개
+
+**결과 (RTX 2070 SUPER):**
+- 정확성: 20/20 PASSED
+- Latency: 0.043 ~ 0.056 ms (avg ~0.054 ms)
+- Speedup: 34.88x ~ 46.60x vs reference
+- Max abs_err: 6.25e-02
+
+**이전 대비:**
+- Avg Latency: 0.054 → 0.054 ms (변화 없음, −0.6% noise 범위)
+- Min Latency: 0.051 → 0.043 ms (**−15.7%** — 2개 workload에서 autotune이 BK=64 선택)
+- Max Latency: 0.055 → 0.056 ms (noise 범위)
+- 정확성: 유지 (20/20 PASS, abs_err 동일)
+
+**비고:**
+- RTX 2070 SUPER에서 대부분의 workload는 autotune이 BK=128 (single-pass) 선택 → avg 변화 없음
+- 2개 workload에서 BK=64가 선택되어 0.043–0.045ms 달성 (−15~16% min latency 개선)
+- BK=64 2-pass는 state를 2번 읽지만 L2 cache hit로 실질적 HBM 추가 비용 최소
+- BK=128 configs는 `if NK == 1:` 분기로 기존 코드와 완전 동일 → zero regression risk
+- B200 (192 SM)에서 BK=64의 occupancy 개선이 더 클 것으로 기대
+- **B200에서 벤치마크 필요** — autotune이 BK=64를 더 많은 workload에서 선택하는지 확인
+---
 
 ## 미적용 최적화 후보
 
@@ -229,8 +272,8 @@
 | C2 | PTX inline softplus | Compute | `ex2.approx` + `lg2.approx`로 1-2 instruction 절약 | Scalar 연산 1회뿐, 전체 성능 영향 무시 가능. |
 | C3 | `tl.math.exp2` / `tl.math.log2` | Compute | 1 PTX instruction으로 exp/log 처리 | C2와 동일 사유. |
 | C4 | Persistent kernel | Parallelism | 큰 batch에서 SM 재활용 | 모든 워크로드가 batch_size=1. |
-| C5 | K-tile 분할 (64+64) | Tiling | 레지스터 압력 감소 | K=128이 thread당 255 레지스터 한도 이내. 분할 시 sync 발생. |
-| C6 | Warp specialization | Parallelism | Load/compute 분리 | T=1 단순 구조에서 overhead가 이득보다 큼. |
+| ~~C5~~ | ~~K-tile 분할 (64+64)~~ | ~~Tiling~~ | ~~레지스터 압력 감소~~ | **적용됨 → O23** |
+| ~~C6~~ | ~~Warp specialization~~ | ~~Parallelism~~ | ~~Load/compute 분리~~ | **적용 불가** — Triton warp spec은 `tl.range(warp_specialize=True)` 루프 기반 파이프라인 기법. T=1 no-loop 커널에 구조적으로 적용 불가. V-tile 루프 변환 시 grid 512→8 blocks로 SM 활용도 파괴. (Attempt 8에서 조사) |
 | ~~C7~~ | ~~1D grid flattening~~ | ~~Scheduling~~ | ~~2D grid scheduling overhead 제거~~ | **적용됨 → O18** |
 | ~~C8~~ | ~~BV=4 autotune config~~ | ~~Tiling~~ | ~~더 많은 block으로 SM 활용도 증가~~ | **적용됨 → O19** |
 | ~~C9~~ | ~~`.contiguous()` 제거~~ | ~~Python~~ | ~~wrapper의 CPU overhead ~3-6µs 감소~~ | **적용됨 → O20 (성능 변화 없음)** |
