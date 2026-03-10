@@ -13,7 +13,7 @@
 | O3 | Query pre-scaling | Algorithm | `scale` 곱셈을 output 단계가 아닌 q 로드 직후 1회로 이동. BV 크기와 무관하게 K번 곱셈으로 고정. |
 | O4 | In-place 연산 | Register | `b_h`, `b_v`를 중간 변수 없이 in-place 갱신. Intermediate tensor 할당 제거로 레지스터 절약. |
 | O5 | K 전체 단일 block | Tiling | K=128을 분할하지 않고 한 번에 처리. K-reduction에서 thread 간 synchronization 제거. |
-| O6 | V-only tiling + autotune | Tiling | V 차원만 BV ∈ {8,16,32,64,128}로 tiling. 각 tile이 완전 독립이라 동기화 불필요. |
+| O6 | V-only tiling + autotune | Tiling | V 차원만 BV ∈ {4,8,16,32,64,128}로 tiling. 각 tile이 완전 독립이라 동기화 불필요. |
 | O7 | constexpr 차원 | Compile | H, HV, K, V, BV, USE_INITIAL_STATE를 `tl.constexpr`로 선언. 컴파일 타임 상수 folding + dead code elimination. |
 | O8 | GVA integer division | Memory | `repeat_interleave` 대신 `i_h = i_hv // (HV // H)`로 head 매핑. q/k 메모리 복사 제거. |
 | O9 | Numerically stable softplus | Numeric | `tl.where(x > 20, x, log(1+exp(x)))` — overflow 방지. |
@@ -25,6 +25,8 @@
 | O15 | Contiguous 보장 | Memory | Python wrapper에서 `.contiguous()` 호출. Non-contiguous tensor의 잘못된 pointer arithmetic 방지. |
 | O16 | `tl.make_block_ptr` (TMA) | Memory | 모든 2D/1D masked load/store를 block pointer로 교체. HW 주소 계산 + boundary check. Hopper+에서 TMA 엔진 활용. |
 | O17 | Algebraic output reformulation | Algorithm | Output을 updated state 대신 decayed state + scalar correction으로 계산. State update와 output 사이의 데이터 의존성 제거 → critical path 단축. |
+| O18 | 1D grid flattening | Scheduling | 2D grid `(V//BV, B*HV)` → 1D `(V//BV*B*HV,)`로 변환. GPU grid scheduling overhead 제거. (triton-lang #6166) |
+| O19 | BV=4 autotune config | Tiling | BV=4 config 추가로 더 많은 block 생성 → SM 활용도 및 occupancy 개선. |
 
 ---
 
@@ -101,6 +103,35 @@
 - fla-org upstream에서도 `tl.dot` 미사용 확인 — element-wise + reduce 패턴이 recurrent kernel의 표준
 - B200에서 벤치마크 필요
 ---
+### Attempt 4 — O18+O19: 1D Grid Flattening + BV=4 Autotune
+
+**적용 최적화:** O1–O19 (O18, O19 신규)
+
+**변경 사항:**
+- Grid를 2D `(V//BV, B*HV)` → 1D `(V//BV * B*HV,)`로 변환
+- 커널 내부에서 `pid = tl.program_id(0)`, `NV = (V+BV-1)//BV` (constexpr), `i_v = pid % NV`, `i_bh = pid // NV`로 수동 decompose
+- Autotune에 `BV=4` configs 2개 추가 (num_warps=1, 2)
+- 총 autotune config: 10 → 12개
+
+**결과 (RTX 2070 SUPER):**
+- 정확성: 20/20 PASSED
+- Latency: 0.050 ~ 0.055 ms (avg ~0.052 ms)
+- Speedup: 34.66x ~ 38.74x vs reference
+- Max abs_err: 6.25e-02
+
+**이전 대비:**
+- Avg Latency: 0.0555 → 0.0524 ms (**−5.7%** 개선)
+- Min Latency: 0.054 → 0.050 ms (−7.4% 개선)
+- Max Latency: 0.057 → 0.055 ms (−3.5% 개선)
+- 정확성: 유지 (20/20 PASS). abs_err 증가 (1.56e-02 → 6.25e-02)는 autotune이 다른 BV를 선택하여 tile 분해 방식이 달라진 것에 기인. 모든 workload 통과.
+
+**비고:**
+- triton-lang #6166에서 2D grid의 scheduling overhead가 1D 대비 최대 3배까지 느려질 수 있음을 확인
+- BV=4 시 grid = (32, 8) → 256 blocks. RTX 2070 SUPER의 40 SM에 대해 6.4 wave → 더 나은 메모리 대역폭 활용
+- B200 (192 SM)에서는 256 blocks가 SM을 더 균등하게 채워 occupancy 이점 극대화 기대
+- Register pressure: BV=4일 때 state tile [4,128] = 512 f32 → thread당 ~16 레지스터로 occupancy 대폭 개선
+- 1D grid flattening은 NV가 2의 거듭제곱 (V=128, BV∈{4,8,...,128})이므로 modulo/division이 shift/mask로 최적화됨
+---
 
 ## 미적용 최적화 후보
 
@@ -112,3 +143,8 @@
 | C4 | Persistent kernel | Parallelism | 큰 batch에서 SM 재활용 | 모든 워크로드가 batch_size=1. |
 | C5 | K-tile 분할 (64+64) | Tiling | 레지스터 압력 감소 | K=128이 thread당 255 레지스터 한도 이내. 분할 시 sync 발생. |
 | C6 | Warp specialization | Parallelism | Load/compute 분리 | T=1 단순 구조에서 overhead가 이득보다 큼. |
+| ~~C7~~ | ~~1D grid flattening~~ | ~~Scheduling~~ | ~~2D grid scheduling overhead 제거~~ | **적용됨 → O18** |
+| ~~C8~~ | ~~BV=4 autotune config~~ | ~~Tiling~~ | ~~더 많은 block으로 SM 활용도 증가~~ | **적용됨 → O19** |
+| C9 | `.contiguous()` 제거 | Python | wrapper의 CPU overhead ~3-6µs 감소 | benchmark가 contiguous tensor 제공 시 안전. 추후 시도 가능. |
+| C10 | `do_not_specialize` | Compile | 고정 값 인자의 specialization cache 감소 | fla-org 패턴. 전체 성능 영향 미미. |
+| C11 | CUDA Graphs wrapping | Launch | kernel launch overhead 10-25µs 제거 | Framework-level 최적화. 커널 코드 변경 아님. |

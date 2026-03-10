@@ -29,6 +29,8 @@ import triton.language as tl
 
 @triton.autotune(
     configs=[
+        triton.Config({"BV": 4}, num_warps=1, num_stages=1),
+        triton.Config({"BV": 4}, num_warps=2, num_stages=1),
         triton.Config({"BV": 8}, num_warps=1, num_stages=1),
         triton.Config({"BV": 8}, num_warps=2, num_stages=1),
         triton.Config({"BV": 16}, num_warps=1, num_stages=1),
@@ -68,15 +70,17 @@ def gdn_decode_fused_kernel(
     """
     Fused GDN decode kernel: gate computation + delta rule update + output.
 
-    Grid: (V // BV, B * HV)
+    Grid: 1D flattened (V // BV * B * HV,) — avoids 2D grid scheduling overhead.
     Each program processes one (batch, v_head, V-tile) combination.
     State: k-last layout [V, K] loaded as [BV, K] tiles via block pointers (TMA on Hopper+).
     """
-    # ── Program identification ───────────────────────────────────────────
-    i_v = tl.program_id(0)  # V-tile index
-    i_bh = tl.program_id(1)  # batch * v_head flattened index
-    i_b = i_bh // HV  # batch index
-    i_hv = i_bh % HV  # v_head index [0..7]
+    # ── Program identification (1D grid, manually decomposed) ──────────
+    pid = tl.program_id(0)
+    NV: tl.constexpr = (V + BV - 1) // BV  # number of V-tiles (compile-time)
+    i_v = pid % NV       # V-tile index
+    i_bh = pid // NV     # batch * v_head flattened index
+    i_b = i_bh // HV     # batch index
+    i_hv = i_bh % HV     # v_head index [0..7]
     i_h = i_hv // (HV // H)  # GVA: map v_head → q/k head [0,0,1,1,2,2,3,3]
 
     # ── Index range (K only — V uses block pointers) ──────────────────
@@ -228,8 +232,8 @@ def kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
     a = a.contiguous()
     b = b.contiguous()
 
-    # Launch kernel — grid tiles over V dimension and batch*v_heads
-    grid = lambda META: (triton.cdiv(V, META["BV"]), B * HV)
+    # Launch kernel — 1D grid: V-tiles × batch × v_heads (avoids 2D scheduling overhead)
+    grid = lambda META: (triton.cdiv(V, META["BV"]) * B * HV,)
 
     gdn_decode_fused_kernel[grid](
         q,
