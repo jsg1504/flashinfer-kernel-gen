@@ -15,7 +15,12 @@ Pack the kernel solution and run the cloud benchmark on a real NVIDIA B200 GPU v
    ```
    This deploys to an NVIDIA B200 GPU on Modal. Expect 1-3 minutes for cold start + execution.
 
-3. **Summarize results** — Present a table:
+3. **Save raw output** — Save the complete Modal output (as-is, no modification) to `history/modal-test-{N}.txt`:
+   - Count existing `history/modal-test-*.txt` files to determine `{N}` (next sequential number).
+   - Create the `history/` directory if it doesn't exist.
+   - Write the raw output verbatim to the file.
+
+4. **Summarize results** — Present a table:
 
    | Metric | Value |
    |--------|-------|
@@ -25,14 +30,14 @@ Pack the kernel solution and run the cloud benchmark on a real NVIDIA B200 GPU v
    | Max abs_err | X.XXe-XX |
    | Max rel_err | X.XXe-XX |
 
-4. **Compare with local** — If local benchmark results were recently run (via `/bench`), compare:
+5. **Compare with local** — If local benchmark results were recently run (via `/bench`), compare:
    - Latency difference (B200 vs local GPU)
    - Correctness consistency (same pass/fail pattern?)
    - Speedup factor changes
 
-5. **Compare with previous B200 run** — If prior B200 results exist, note improvements or regressions.
+6. **Compare with previous B200 run** — Read the most recent `history/modal-test-*.txt` file (if any prior run exists) and note improvements or regressions in pass rate, latency, speedup, and error margins.
 
-6. **Suggest next action** — Based on results:
+7. **Suggest next action** — Based on results:
    - All passed + competitive speedup → "Ready for submission or further optimization"
    - Failures → "Correctness issue — debug locally first with `/bench`"
    - Perf below expectation → "Profile with `/profile` and check B200-specific tuning (block sizes, TMA)"
