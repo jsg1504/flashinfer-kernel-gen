@@ -23,6 +23,7 @@
 | O13 | Scalar broadcast load | Memory | Gate 파라미터(A_log, dt_bias, a, b)를 scalar로 로드 → L1 cache broadcast, HBM 비용 0. |
 | O14 | num_stages=1 | Compile | T=1 decode에서 loop 없으므로 software pipelining 비활성화. 불필요한 prefetch 코드 제거. |
 | O15 | Contiguous 보장 | Memory | Python wrapper에서 `.contiguous()` 호출. Non-contiguous tensor의 잘못된 pointer arithmetic 방지. |
+| O16 | `tl.make_block_ptr` (TMA) | Memory | 모든 2D/1D masked load/store를 block pointer로 교체. HW 주소 계산 + boundary check. Hopper+에서 TMA 엔진 활용. |
 
 ---
 
@@ -43,13 +44,40 @@
 - 첫 시도에서 모든 기본 최적화를 한꺼번에 적용
 - B200 벤치마크 미실행 (Modal 미설정)
 
+### Attempt 2 — C1: `tl.make_block_ptr` TMA loads/stores (O16)
+
+**적용 최적화:** O1–O16 (O16 신규)
+
+**결과 (RTX 2070 SUPER):**
+- 정확성: 20/20 PASSED
+- Latency: 0.052 ~ 0.061 ms (avg ~0.055 ms)
+- Speedup: 31.59x ~ 37.71x vs reference
+- Max abs_err: 3.12e-02
+
+**변경 사항:**
+- State load [BV, K]: pointer arithmetic + mask → `tl.make_block_ptr` + `boundary_check=(0,)`
+- State store [BV, K]: pointer arithmetic + mask → `tl.make_block_ptr` + `boundary_check=(0,)`
+- V load [BV]: pointer arithmetic + mask → `tl.make_block_ptr` + `boundary_check=(0,)`
+- Output store [BV]: pointer arithmetic + mask → `tl.make_block_ptr` + `boundary_check=(0,)`
+- `o_v`, `mask_v` 변수 제거 (block pointer가 대체)
+
+**이전 대비:**
+- Latency: 동일 (~0.055 ms, RTX 2070 SUPER에서 TMA 미지원이므로 예상대로)
+- 정확성: 유지 (20/20 PASS, abs_err 동일)
+- 분산 감소: 0.047~0.066 → 0.052~0.061 (tighter variance)
+
+**비고:**
+- RTX 2070 SUPER (Turing, SM75)에서는 `tl.make_block_ptr`이 일반 load로 fallback하여 성능 차이 없음
+- B200 (Blackwell)에서는 TMA 엔진이 주소 계산을 HW에서 처리하여 SM ALU 절감 기대
+- 코드가 더 깔끔해짐 (pointer arithmetic + mask 패턴 → block pointer + boundary_check 패턴)
+- B200에서 벤치마크 필요
 ---
 
 ## 미적용 최적화 후보
 
 | # | 최적화 | 분류 | 기대 효과 | 미적용 사유 |
 |---|--------|------|----------|------------|
-| C1 | `tl.make_block_ptr` (TMA load) | Memory | HW 주소 계산으로 SM ALU 절감, async copy | 현재 성능 충분. B200에서 효과 검증 필요. |
+| ~~C1~~ | ~~`tl.make_block_ptr` (TMA load)~~ | ~~Memory~~ | ~~HW 주소 계산으로 SM ALU 절감~~ | **적용됨 → O16** |
 | C2 | PTX inline softplus | Compute | `ex2.approx` + `lg2.approx`로 1-2 instruction 절약 | Scalar 연산 1회뿐, 전체 성능 영향 무시 가능. |
 | C3 | `tl.math.exp2` / `tl.math.log2` | Compute | 1 PTX instruction으로 exp/log 처리 | C2와 동일 사유. |
 | C4 | Persistent kernel | Parallelism | 큰 batch에서 SM 재활용 | 모든 워크로드가 batch_size=1. |

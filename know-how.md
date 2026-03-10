@@ -558,18 +558,17 @@ tl.store(output_ptr + ..., b_o, mask=mask_v)               # store에도 mask
 
 ---
 
-## 9. 추가 최적화 후보 (미적용)
+## 9. 추가 최적화 후보 (일부 적용)
 
-### 9.1 `tl.make_block_ptr` (TMA Load)
+### 9.1 `tl.make_block_ptr` (TMA Load) — ✅ 적용됨 (O16)
 
 Hopper/Blackwell GPU에서 Tensor Memory Accelerator(TMA)를 활용한 block 단위 로드:
 
 ```python
-# 현재 (pointer arithmetic + mask)
-p_state = state_ptr + (i_b * HV + i_hv) * V * K + o_v[:, None] * K + o_k[None, :]
-b_h = tl.load(p_state, mask=mask_v[:, None], other=0.0)
-
-# TMA 방식 (block pointer)
+# Before (pointer arithmetic + mask) — 제거됨
+# p_state = state_ptr + ... + o_v[:, None] * K + o_k[None, :]
+# b_h = tl.load(p_state, mask=mask_v[:, None], other=0.0)
+# After — 현재 적용된 TMA 방식 (block pointer)
 p_h = tl.make_block_ptr(
     state_ptr + (i_b * HV + i_hv) * V * K,
     shape=(V, K),
@@ -581,12 +580,14 @@ p_h = tl.make_block_ptr(
 b_h = tl.load(p_h, boundary_check=(0,))
 ```
 
-**기대 효과:**
+**효과 (확인됨):**
 - TMA 엔진이 주소 계산을 하드웨어에서 처리 — SM의 ALU 부담 감소
-- Boundary check가 하드웨어에서 처리되어 mask 연산 불필요
-- B200에서 TMA가 async copy를 지원하여 latency hiding 개선
+- Boundary check가 하드웨어에서 처리되어 mask 연산 불필요 (`o_v`, `mask_v` 변수 제거)
+- B200에서 TMA가 async copy를 지원하여 latency hiding 개선 기대
+- RTX 2070 SUPER에서는 일반 load로 fallback하여 성능 차이 없음 (Turing은 TMA 미지원)
+- 코드 가독성 향상: pointer arithmetic + mask 패턴 → block pointer + boundary_check 패턴
 
-**미적용 이유:** 현재 pointer arithmetic 방식으로도 충분한 성능 (30x+ speedup). TMA의 효과는 state 크기가 더 클 때 두드러짐.
+**적용 범위:** state load [BV,K], state store [BV,K], v load [BV], output store [BV] — 총 4개 접근점
 
 ### 9.2 PTX Inline Softplus
 

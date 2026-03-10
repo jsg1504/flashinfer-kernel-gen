@@ -70,7 +70,7 @@ def gdn_decode_fused_kernel(
 
     Grid: (V // BV, B * HV)
     Each program processes one (batch, v_head, V-tile) combination.
-    State: k-last layout [V, K] loaded as [BV, K] tiles in registers.
+    State: k-last layout [V, K] loaded as [BV, K] tiles via block pointers (TMA on Hopper+).
     """
     # ── Program identification ───────────────────────────────────────────
     i_v = tl.program_id(0)  # V-tile index
@@ -79,19 +79,22 @@ def gdn_decode_fused_kernel(
     i_hv = i_bh % HV  # v_head index [0..7]
     i_h = i_hv // (HV // H)  # GVA: map v_head → q/k head [0,0,1,1,2,2,3,3]
 
-    # ── Index ranges ─────────────────────────────────────────────────────
-    o_k = tl.arange(0, K)  # [0..127] full K dimension
-    o_v = i_v * BV + tl.arange(0, BV)  # V-tile indices
-    mask_v = o_v < V
+    # ── Index range (K only — V uses block pointers) ──────────────────
+    o_k = tl.arange(0, K)  # [0..127] full K dimension (for q, k loads)
 
-    # ── Load state tile [BV, K] ──────────────────────────────────────────
+    # ── Load state tile [BV, K] via block pointer (TMA on Hopper+) ────
     # state: [B, HV, V, K] contiguous, k-last layout
-    # Each tile is a [BV, K] slice where rows=V, cols=K
-    p_state = (
-        state_ptr + (i_b * HV + i_hv) * V * K + o_v[:, None] * K + o_k[None, :]
+    # tl.make_block_ptr lets HW handle address calc + boundary check
+    p_state = tl.make_block_ptr(
+        state_ptr + (i_b * HV + i_hv) * V * K,
+        shape=(V, K),
+        strides=(K, 1),
+        offsets=(i_v * BV, 0),
+        block_shape=(BV, K),
+        order=(1, 0),  # K is contiguous (col-major in ptr terms)
     )
     if USE_INITIAL_STATE:
-        b_h = tl.load(p_state, mask=mask_v[:, None], other=0.0).to(tl.float32)
+        b_h = tl.load(p_state, boundary_check=(0,)).to(tl.float32)
     else:
         b_h = tl.zeros([BV, K], dtype=tl.float32)
 
@@ -100,11 +103,17 @@ def gdn_decode_fused_kernel(
     b_q = tl.load(q_ptr + (i_b * H + i_h) * K + o_k).to(tl.float32)
     b_k = tl.load(k_ptr + (i_b * H + i_h) * K + o_k).to(tl.float32)
 
-    # ── Load v[BV] ──────────────────────────────────────────────────────
+    # ── Load v[BV] via block pointer ──────────────────────────────────
     # v: [B, 1, HV, V] contiguous
-    b_v = tl.load(
-        v_ptr + (i_b * HV + i_hv) * V + o_v, mask=mask_v, other=0.0
-    ).to(tl.float32)
+    p_v = tl.make_block_ptr(
+        v_ptr + (i_b * HV + i_hv) * V,
+        shape=(V,),
+        strides=(1,),
+        offsets=(i_v * BV,),
+        block_shape=(BV,),
+        order=(0,),
+    )
+    b_v = tl.load(p_v, boundary_check=(0,)).to(tl.float32)
 
     # ── Compute gate g and beta from raw parameters ──────────────────────
     # All are scalar per (batch, v_head)
@@ -150,21 +159,27 @@ def gdn_decode_fused_kernel(
     # 5. Compute output: o = scale * q @ state (q already pre-scaled)
     b_o = tl.sum(b_h * b_q[None, :], 1)
 
-    # ── Store output [B, 1, HV, V] ──────────────────────────────────────
-    tl.store(
-        output_ptr + (i_b * HV + i_hv) * V + o_v,
-        b_o.to(tl.bfloat16),
-        mask=mask_v,
+    # ── Store output [B, 1, HV, V] via block pointer ─────────────────
+    p_output = tl.make_block_ptr(
+        output_ptr + (i_b * HV + i_hv) * V,
+        shape=(V,),
+        strides=(1,),
+        offsets=(i_v * BV,),
+        block_shape=(BV,),
+        order=(0,),
     )
+    tl.store(p_output, b_o.to(tl.bfloat16), boundary_check=(0,))
 
-    # ── Store updated state [B, HV, V, K] ───────────────────────────────
-    p_new_state = (
-        new_state_ptr
-        + (i_b * HV + i_hv) * V * K
-        + o_v[:, None] * K
-        + o_k[None, :]
+    # ── Store updated state [B, HV, V, K] via block pointer ──────────
+    p_new_state = tl.make_block_ptr(
+        new_state_ptr + (i_b * HV + i_hv) * V * K,
+        shape=(V, K),
+        strides=(K, 1),
+        offsets=(i_v * BV, 0),
+        block_shape=(BV, K),
+        order=(1, 0),
     )
-    tl.store(p_new_state, b_h.to(tl.float32), mask=mask_v[:, None])
+    tl.store(p_new_state, b_h.to(tl.float32), boundary_check=(0,))
 
 
 def kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
