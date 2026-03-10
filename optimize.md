@@ -28,6 +28,7 @@
 | O18 | 1D grid flattening | Scheduling | 2D grid `(V//BV, B*HV)` → 1D `(V//BV*B*HV,)`로 변환. GPU grid scheduling overhead 제거. (triton-lang #6166) |
 | O19 | BV=4 autotune config | Tiling | BV=4 config 추가로 더 많은 block 생성 → SM 활용도 및 occupancy 개선. |
 | O20 | `.contiguous()` 제거 | Python | `.contiguous()` 호출 제거. Benchmark가 contiguous tensor를 보장하므로 불필요한 Python 오버헤드 제거. |
+| O21 | q/k block pointer (TMA) | Memory | q, k 로드를 `tl.make_block_ptr`로 변환. `o_k = tl.arange(0, K)` 변수 제거. 모든 메모리 접근이 TMA 경로 사용. |
 
 ---
 
@@ -159,6 +160,34 @@
 - 코드 단순화 이점은 있으나 성능 개선은 미미
 - 이 결과는 현재 RTX 2070 SUPER에서 kernel+launch overhead 최적화가 한계에 도달했음을 시사
 - **B200에서 벤치마크 필요** — memory가 ~18배 빠르므로 CPU/launch overhead 비중이 더 커져 차이가 나타날 수 있음
+---
+### Attempt 6 — O21: q/k Block Pointer Migration (Complete TMA Coverage)
+
+**적용 최적화:** O1–O14, O16–O21 (O21 신규)
+
+**결과 (RTX 2070 SUPER):**
+- 정확성: 20/20 PASSED
+- Latency: 0.044 ~ 0.053 ms (avg ~0.051 ms)
+- Speedup: 35.26x ~ 45.85x vs reference
+- Max abs_err: 1.25e-01
+
+**변경 사항:**
+- q, k 로드를 pointer arithmetic + `o_k` arange → `tl.make_block_ptr` block pointer로 변환
+- `o_k = tl.arange(0, K)` 변수 완전 제거
+- `boundary_check` 불필요 (K는 constexpr이며 block_shape와 정확히 일치)
+- 이로써 커널 내 모든 메모리 접근(state, q, k, v, output)이 block pointer 방식 통일
+
+**이전 대비:**
+- Avg Latency: 0.052 → 0.051 ms (noise 범위, 실질적 변화 없음)
+- Min Latency: 0.050 → 0.044 ms (일부 workload에서 개선, autotune artifact 가능)
+- 정확성: 유지 (20/20 PASS). abs_err 변동은 autotune 재컴파일 후 다른 BV 선택에 기인.
+
+**비고:**
+- RTX 2070 SUPER (Turing, SM75)에서는 TMA 미지원이므로 O16과 동일하게 일반 load로 fallback
+- B200 (Blackwell)에서는 q, k 로드도 TMA 엔진이 주소 계산을 HW에서 처리
+- 코드 정리 효과: `o_k` 변수 제거로 커널 내 pointer arithmetic 완전 제거
+- 이 변경으로 모든 메모리 접근이 `tl.make_block_ptr` 통일 — TMA 최적화 기반 완료
+- **B200에서 벤치마크 필요** — TMA 효과 측정 가능
 ---
 
 ## 미적용 최적화 후보

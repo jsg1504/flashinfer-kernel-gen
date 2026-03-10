@@ -588,7 +588,7 @@ tl.store(output_ptr + ..., b_o, mask=mask_v)               # store에도 mask
 
 ## 9. 추가 최적화 후보 (일부 적용)
 
-### 9.1 `tl.make_block_ptr` (TMA Load) — ✅ 적용됨 (O16)
+### 9.1 `tl.make_block_ptr` (TMA Load) — ✅ 적용됨 (O16, O21)
 
 Hopper/Blackwell GPU에서 Tensor Memory Accelerator(TMA)를 활용한 block 단위 로드:
 
@@ -615,7 +615,7 @@ b_h = tl.load(p_h, boundary_check=(0,))
 - RTX 2070 SUPER에서는 일반 load로 fallback하여 성능 차이 없음 (Turing은 TMA 미지원)
 - 코드 가독성 향상: pointer arithmetic + mask 패턴 → block pointer + boundary_check 패턴
 
-**적용 범위:** state load [BV,K], state store [BV,K], v load [BV], output store [BV] — 총 4개 접근점
+**적용 범위:** state load [BV,K], state store [BV,K], v load [BV], output store [BV], q load [K], k load [K] — 총 6개 접근점 (O21에서 q/k 추가, `o_k` 변수 제거)
 
 ### 9.2 PTX Inline Softplus
 

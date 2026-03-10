@@ -83,9 +83,6 @@ def gdn_decode_fused_kernel(
     i_hv = i_bh % HV     # v_head index [0..7]
     i_h = i_hv // (HV // H)  # GVA: map v_head → q/k head [0,0,1,1,2,2,3,3]
 
-    # ── Index range (K only — V uses block pointers) ──────────────────
-    o_k = tl.arange(0, K)  # [0..127] full K dimension (for q, k loads)
-
     # ── Load state tile [BV, K] via block pointer (TMA on Hopper+) ────
     # state: [B, HV, V, K] contiguous, k-last layout
     # tl.make_block_ptr lets HW handle address calc + boundary check
@@ -102,10 +99,26 @@ def gdn_decode_fused_kernel(
     else:
         b_h = tl.zeros([BV, K], dtype=tl.float32)
 
-    # ── Load q[K], k[K] (GVA: indexed by q/k head) ──────────────────────
-    # q, k: [B, 1, H, K] contiguous — skip seq_len=1 dim
-    b_q = tl.load(q_ptr + (i_b * H + i_h) * K + o_k).to(tl.float32)
-    b_k = tl.load(k_ptr + (i_b * H + i_h) * K + o_k).to(tl.float32)
+    # ── Load q[K], k[K] via block pointer (GVA: indexed by q/k head) ─
+    # q, k: [B, 1, H, K] contiguous — K is full block, no boundary check needed
+    p_q = tl.make_block_ptr(
+        q_ptr + (i_b * H + i_h) * K,
+        shape=(K,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(K,),
+        order=(0,),
+    )
+    p_k = tl.make_block_ptr(
+        k_ptr + (i_b * H + i_h) * K,
+        shape=(K,),
+        strides=(1,),
+        offsets=(0,),
+        block_shape=(K,),
+        order=(0,),
+    )
+    b_q = tl.load(p_q).to(tl.float32)
+    b_k = tl.load(p_k).to(tl.float32)
 
     # ── Load v[BV] via block pointer ──────────────────────────────────
     # v: [B, 1, HV, V] contiguous
